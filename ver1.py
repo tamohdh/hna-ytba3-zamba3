@@ -1208,6 +1208,64 @@ def page_help():
 
 ---
 
+## Electricity Calculation Formulas
+
+```
+Step 1 — Wall cooling load (kWh/yr):
+  Wall area (m²) = (4 × √floor_area × ceiling_height) − total_window_area
+  Wall cooling load = Wall area × Wall U-value × 15°C × 8 hrs × 120 days ÷ 1000
+
+Step 2 — Window cooling load (kWh/yr):
+  Window area total = window_count × window_area_per_window
+  Window cooling load = Window area × Window U-value × 15°C × 8 hrs × 120 days ÷ 1000
+
+Step 3 — Appliance energy (kWh/yr):
+  Each appliance = Watts × hours/day × days/year ÷ 1000
+  AC appliances  → 120 days/year (seasonal)
+  All others     → 365 days/year
+
+Step 4 — Plug load (kWh/yr):
+  Plug load = plug_count × 50W × 8 hrs × 365 days ÷ 1000
+
+Step 5 — Apply multipliers:
+  Total room electricity = (wall + window + appliances + plugs)
+                         × elec_cooling_multiplier
+                         × location_multiplier
+
+Step 6 — Apartment total:
+  Apartment electricity = sum of all rooms
+
+Step 7 — Building total:
+  Building electricity = sum of all apartments across all floors
+
+Step 8 — EUI (Energy Use Intensity):
+  EUI (kWh/m²/yr) = Building total ÷ Total floor area
+
+Step 9 — Cost:
+  Cost/yr (USD) = kWh × electricity_price_usd
+  Cost/yr (DZD) = Cost/yr (USD) × exchange_rate
+  Avg cost/hr   = Cost/yr ÷ 8,760
+```
+
+**Wall U-values (W/m²K):**
+| Material | U-value |
+|----------|---------|
+| Brick | 1.84 |
+| Concrete | 2.00 |
+| Block | 1.50 |
+| Insulated (5cm) | 0.80 |
+| Insulated (10cm) | 0.35 |
+
+**Window U-values (W/m²K):**
+| Type | U-value |
+|------|---------|
+| Single glazed | 5.82 |
+| Double glazed | 2.70 |
+
+**Assumed constants:** ΔT = 15°C  |  Cooling season = 120 days  |  Cooling hrs/day = 8
+
+---
+
 ## Gas Calculation Formula
 ```
 Heating gas (kWh/yr) =
