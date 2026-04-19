@@ -1,5 +1,5 @@
 """
-Building Energy Forecaster
+Building Energy Forecaster — Electricity + Gas
 Full hierarchy: Building → Floors → Apartments → Rooms
 Master Year Project
 """
@@ -26,10 +26,10 @@ st.set_page_config(
 # CONSTANTS
 # ─────────────────────────────────────────────
 CLIMATE_ZONES = {
-    "Coast":     {"cooling": 1.1, "heating": 0.8,  "desc": "Humid, moderate temperatures"},
-    "Desert":    {"cooling": 1.4, "heating": 0.6,  "desc": "Hot days, cool nights, high solar"},
-    "Mountains": {"cooling": 0.6, "heating": 1.5,  "desc": "Cold winters, mild summers"},
-    "City":      {"cooling": 1.0, "heating": 1.0,  "desc": "Urban heat island, baseline"},
+    "Coast":     {"elec_cooling": 1.1, "elec_heating": 0.8, "gas_heating": 0.8,  "desc": "Humid, moderate temperatures"},
+    "Desert":    {"elec_cooling": 1.4, "elec_heating": 0.6, "gas_heating": 0.6,  "desc": "Hot days, cool nights, high solar"},
+    "Mountains": {"elec_cooling": 0.6, "elec_heating": 1.5, "gas_heating": 1.5,  "desc": "Cold winters, mild summers"},
+    "City":      {"elec_cooling": 1.0, "elec_heating": 1.0, "gas_heating": 1.0,  "desc": "Urban heat island, baseline"},
 }
 
 LOCATION_MULTIPLIERS = {
@@ -51,7 +51,9 @@ WINDOW_U_VALUES = {
     "Double": 2.70,
 }
 
-APPLIANCE_TEMPLATES = [
+ROOF_U_VALUE = 0.75   # W/m²K — standard uninsulated flat roof
+
+ELEC_APPLIANCE_TEMPLATES = [
     {"name": "Refrigerator",        "watts": 150,  "hours": 24},
     {"name": "AC (window unit)",    "watts": 1000, "hours": 8},
     {"name": "AC (split)",          "watts": 800,  "hours": 8},
@@ -68,6 +70,15 @@ APPLIANCE_TEMPLATES = [
     {"name": "Lighting (per room)", "watts": 15,   "hours": 5},
 ]
 
+GAS_APPLIANCE_TEMPLATES = [
+    {"name": "Gas Heater",       "kwh_per_hour": 2.5,  "hours": 4},
+    {"name": "Gas Water Heater", "kwh_per_hour": 3.0,  "hours": 1},
+    {"name": "Gas Oven",         "kwh_per_hour": 2.0,  "hours": 1},
+    {"name": "Gas Stove",        "kwh_per_hour": 1.5,  "hours": 1},
+    {"name": "Gas Dryer",        "kwh_per_hour": 2.5,  "hours": 1},
+    {"name": "Gas Fireplace",    "kwh_per_hour": 5.0,  "hours": 3},
+]
+
 EUI_BENCHMARKS = [
     (50,  "Excellent — Passive/Net-Zero standard"),
     (100, "Good — Energy-efficient building"),
@@ -77,8 +88,14 @@ EUI_BENCHMARKS = [
     (999, "Very poor — Urgent action required"),
 ]
 
-DB_PATH      = "building_energy.db"
+# Argentina study benchmark: 88% gas / 12% electricity
+ARG_GAS_SHARE  = 0.88
+ARG_ELEC_SHARE = 0.12
+
+DB_PATH       = "building_energy.db"
 HOURS_IN_YEAR = 8760
+DEGREE_DAYS   = 1136   # standard heating degree-days
+HEATER_EFF    = 0.65   # gas heater efficiency
 
 # ─────────────────────────────────────────────
 # DATABASE
@@ -103,12 +120,8 @@ def save_project_to_db(project_name, building_data, floors_data):
     c = conn.cursor()
     c.execute(
         "INSERT INTO projects (name, created_date, building_json, floors_json) VALUES (?,?,?,?)",
-        (
-            project_name,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            json.dumps(building_data),
-            json.dumps(floors_data),
-        ),
+        (project_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+         json.dumps(building_data), json.dumps(floors_data)),
     )
     conn.commit()
     conn.close()
@@ -145,7 +158,6 @@ def delete_project_from_db(project_id):
 # DEFAULT DATA FACTORIES
 # ─────────────────────────────────────────────
 def default_room(name="Room 1"):
-    """A room holds all the physical + appliance data (previously on the apartment)."""
     return {
         "name":                      name,
         "area_m2":                   20.0,
@@ -156,13 +168,15 @@ def default_room(name="Room 1"):
         "window_type":               "Single",
         "plug_count":                4,
         "ceiling_height_m":          2.5,
-        "appliances":                [],
+        "appliances":                [],      # electric appliances
     }
 
 def default_apartment(name="Apartment A"):
-    """An apartment is a container for rooms."""
     return {
-        "name":  name,
+        "name":       name,
+        "occupants":  4,                      # for gas hot water calculation
+        "cooking_kwh": 1825.0,                # default cooking gas kWh/year
+        "gas_appliances": [],                 # gas appliances list
         "rooms": {
             "1": default_room("Living Room"),
             "2": default_room("Bedroom"),
@@ -189,7 +203,7 @@ def next_apt_key(existing_keys):
 
 def next_room_key(existing_keys):
     used = set(str(k) for k in existing_keys)
-    for i in range(1, 100):
+    for i in range(1, 200):
         if str(i) not in used:
             return str(i)
     return str(len(existing_keys) + 1)
@@ -208,6 +222,7 @@ def init_session_state():
             "climate_zone":          "Coast",
             "location_type":         "Urban",
             "electricity_price_usd": 0.12,
+            "gas_price_usd":         0.02,
             "exchange_rate":         135.0,
             "created_date":          datetime.now().strftime("%Y-%m-%d"),
         }
@@ -226,31 +241,10 @@ def init_session_state():
     if "show_cost" not in st.session_state:
         st.session_state.show_cost = True
 
-def get_current_room():
-    """Return the currently selected room dict (safe)."""
-    floors = st.session_state.floors
-    cf = st.session_state.current_floor
-    ca = st.session_state.current_apartment
-    cr = st.session_state.current_room
-
-    if cf not in floors:
-        cf = sorted(floors.keys())[0]
-        st.session_state.current_floor = cf
-    apts = floors[cf]["apartments"]
-    if ca not in apts:
-        ca = sorted(apts.keys())[0]
-        st.session_state.current_apartment = ca
-    rooms = apts[ca]["rooms"]
-    if cr not in rooms:
-        cr = sorted(rooms.keys())[0]
-        st.session_state.current_room = cr
-    return floors[cf]["apartments"][ca]["rooms"][cr]
-
 # ─────────────────────────────────────────────
-# CALCULATIONS  (room → apartment → building)
+# ELECTRICITY CALCULATIONS
 # ─────────────────────────────────────────────
 def calculate_room_electricity(room, climate_zone, location_type):
-    """kWh/year breakdown for one room."""
     area             = room.get("area_m2", 20.0)
     wall_u           = WALL_U_VALUES.get(room.get("wall_material", "Brick"), 1.84)
     window_count     = room.get("window_count", 2)
@@ -268,7 +262,7 @@ def calculate_room_electricity(room, climate_zone, location_type):
     cooling_days = 120
     cooling_hrs  = 8
 
-    wall_load   = wall_area   * wall_u   * delta_t * cooling_hrs * cooling_days / 1000
+    wall_load   = wall_area        * wall_u   * delta_t * cooling_hrs * cooling_days / 1000
     window_load = window_area_total * window_u * delta_t * cooling_hrs * cooling_days / 1000
 
     appliance_total     = 0.0
@@ -285,9 +279,9 @@ def calculate_room_electricity(room, climate_zone, location_type):
 
     plug_load = plug_count * 50 * 8 * 365 / 1000
 
-    climate_mult = CLIMATE_ZONES.get(climate_zone, {}).get("cooling", 1.0)
-    loc_mult     = LOCATION_MULTIPLIERS.get(location_type, 1.0)
-    mult         = climate_mult * loc_mult
+    elec_mult = CLIMATE_ZONES.get(climate_zone, {}).get("elec_cooling", 1.0)
+    loc_mult  = LOCATION_MULTIPLIERS.get(location_type, 1.0)
+    mult      = elec_mult * loc_mult
 
     total = (wall_load + window_load + appliance_total + plug_load) * mult
 
@@ -299,43 +293,129 @@ def calculate_room_electricity(room, climate_zone, location_type):
         "total":               total,
         "appliance_breakdown": appliance_breakdown,
         "area_m2":             area,
+        "ceiling_h":           ceiling_h,
+        # raw (pre-multiplier) losses for gas heating reuse
+        "raw_wall_loss":   wall_load,
+        "raw_window_loss": window_load,
     }
 
-def calculate_apartment_total(apt, climate_zone, location_type):
-    """Sum of all rooms in an apartment."""
-    total        = 0.0
-    total_area   = 0.0
-    room_results = {}
-    for room_key, room_data in apt.get("rooms", {}).items():
-        res = calculate_room_electricity(room_data, climate_zone, location_type)
-        total      += res["total"]
-        total_area += res["area_m2"]
-        room_results[room_key] = res
+def calculate_apartment_electricity(apt, climate_zone, location_type):
+    total = 0.0; total_area = 0.0; room_results = {}
+    for rk, rd in apt.get("rooms", {}).items():
+        res = calculate_room_electricity(rd, climate_zone, location_type)
+        total += res["total"]; total_area += res["area_m2"]
+        room_results[rk] = res
     return {"total": total, "total_area": total_area, "room_results": room_results}
 
-def calculate_building_total(floors_data, climate_zone, location_type):
-    """Full building summary."""
-    building_total = 0.0
-    total_area     = 0.0
-    floor_totals   = {}
-    apt_results    = {}
+# ─────────────────────────────────────────────
+# GAS CALCULATIONS
+# ─────────────────────────────────────────────
+def calculate_room_gas_heating(room, climate_zone):
+    """
+    Gas heating for one room.
+    Formula: (wall_loss + window_loss + roof_loss) × degree_days × volume × climate_factor / heater_eff
+    We normalise the envelope losses to a per-degree-day basis then scale.
+    """
+    area      = room.get("area_m2", 20.0)
+    ceiling_h = room.get("ceiling_height_m", 2.5)
+    volume    = area * ceiling_h  # m³
 
-    for floor_num, floor_data in floors_data.items():
-        floor_total = 0.0
-        for apt_key, apt_data in floor_data.get("apartments", {}).items():
-            apt_res = calculate_apartment_total(apt_data, climate_zone, location_type)
-            floor_total    += apt_res["total"]
-            building_total += apt_res["total"]
-            total_area     += apt_res["total_area"]
-            apt_results[(floor_num, apt_key)] = apt_res
-        floor_totals[floor_num] = floor_total
+    wall_u           = WALL_U_VALUES.get(room.get("wall_material", "Brick"), 1.84)
+    window_count     = room.get("window_count", 2)
+    window_area_each = room.get("window_area_per_window_m2", 1.5)
+    window_u         = WINDOW_U_VALUES.get(room.get("window_type", "Single"), 5.82)
+    window_area_total = window_count * window_area_each
 
-    eui = building_total / total_area if total_area > 0 else 0
+    side       = math.sqrt(max(area, 1))
+    gross_wall = 4 * side * ceiling_h
+    wall_area  = max(gross_wall - window_area_total, 0)
+    roof_area  = area  # floor area = roof area (simpler model)
+
+    # U-value × area for each element (W/K)
+    wall_ua   = wall_area        * wall_u
+    window_ua = window_area_total * window_u
+    roof_ua   = roof_area        * ROOF_U_VALUE
+    total_ua  = wall_ua + window_ua + roof_ua   # W/K
+
+    gas_climate = CLIMATE_ZONES.get(climate_zone, {}).get("gas_heating", 1.0)
+
+    # kWh/year = UA (W/K) × degree_days (K·days) × 24h/day / 1000W/kW / heater_eff × climate_factor
+    heating_kwh = (total_ua * DEGREE_DAYS * 24 / 1000) * gas_climate / HEATER_EFF
+
+    return heating_kwh
+
+def calculate_apartment_gas(apt, climate_zone):
+    """
+    Total gas kWh/year for an apartment.
+    Components: heating (sum of rooms) + hot water + cooking + gas appliances.
+    """
+    # 1. Heating — sum across rooms
+    heating_total = 0.0
+    for room_data in apt.get("rooms", {}).values():
+        heating_total += calculate_room_gas_heating(room_data, climate_zone)
+
+    # 2. Hot water
+    occupants = apt.get("occupants", 4)
+    hot_water_kwh = occupants * 1095.0
+
+    # 3. Cooking
+    cooking_kwh = apt.get("cooking_kwh", 1825.0)
+
+    # 4. Gas appliances
+    gas_appliance_total = 0.0
+    gas_appl_breakdown  = []
+    for appl in apt.get("gas_appliances", []):
+        n   = appl.get("name", "Unknown")
+        kph = appl.get("kwh_per_hour", 0.0)
+        h   = appl.get("hours", 0.0)
+        kwh = kph * h * 365
+        gas_appliance_total += kwh
+        gas_appl_breakdown.append({"name": n, "kwh": kwh, "kwh_per_hour": kph, "hours": h})
+
+    total_gas = heating_total + hot_water_kwh + cooking_kwh + gas_appliance_total
+
     return {
-        "building_total": building_total,
+        "heating":            heating_total,
+        "hot_water":          hot_water_kwh,
+        "cooking":            cooking_kwh,
+        "gas_appliances":     gas_appliance_total,
+        "total":              total_gas,
+        "gas_appl_breakdown": gas_appl_breakdown,
+    }
+
+# ─────────────────────────────────────────────
+# BUILDING TOTALS
+# ─────────────────────────────────────────────
+def calculate_building_total(floors_data, climate_zone, location_type):
+    building_elec = 0.0; building_gas = 0.0
+    total_area    = 0.0
+    floor_elec    = {}; floor_gas = {}
+    apt_results   = {}
+
+    for fn, fd in floors_data.items():
+        fe = 0.0; fg = 0.0
+        for ak, ad in fd.get("apartments", {}).items():
+            er = calculate_apartment_electricity(ad, climate_zone, location_type)
+            gr = calculate_apartment_gas(ad, climate_zone)
+            fe += er["total"]; fg += gr["total"]
+            building_elec += er["total"]; building_gas += gr["total"]
+            total_area    += er["total_area"]
+            apt_results[(fn, ak)] = {"elec": er, "gas": gr}
+        floor_elec[fn] = fe; floor_gas[fn] = fg
+
+    total_energy = building_elec + building_gas
+    eui_elec = building_elec / total_area if total_area > 0 else 0
+    eui_total = total_energy  / total_area if total_area > 0 else 0
+
+    return {
+        "building_elec":  building_elec,
+        "building_gas":   building_gas,
+        "total_energy":   total_energy,
         "total_area":     total_area,
-        "eui":            eui,
-        "floor_totals":   floor_totals,
+        "eui_elec":       eui_elec,
+        "eui_total":      eui_total,
+        "floor_elec":     floor_elec,
+        "floor_gas":      floor_gas,
         "apt_results":    apt_results,
     }
 
@@ -348,37 +428,38 @@ def get_eui_benchmark(eui):
 # ─────────────────────────────────────────────
 # COST HELPERS
 # ─────────────────────────────────────────────
-def cost_per_year(kwh):
-    price = st.session_state.building.get("electricity_price_usd", 0.12)
-    rate  = st.session_state.building.get("exchange_rate", 135.0)
-    usd   = kwh * price
-    dzd   = usd * rate
-    return usd, dzd
+def elec_cost(kwh):
+    p = st.session_state.building.get("electricity_price_usd", 0.12)
+    r = st.session_state.building.get("exchange_rate", 135.0)
+    return kwh * p, kwh * p * r
 
-def cost_per_hour(kwh):
-    usd_yr, dzd_yr = cost_per_year(kwh)
-    return usd_yr / HOURS_IN_YEAR, dzd_yr / HOURS_IN_YEAR
+def gas_cost(kwh):
+    p = st.session_state.building.get("gas_price_usd", 0.02)
+    r = st.session_state.building.get("exchange_rate", 135.0)
+    return kwh * p, kwh * p * r
 
-def fmt_cost_year(kwh):
-    usd, dzd = cost_per_year(kwh)
+def fmt_usd_dzd(usd, dzd):
     return f"${usd:,.2f} USD  /  {dzd:,.0f} DZD"
 
-def fmt_cost_hour(kwh):
-    usd, dzd = cost_per_hour(kwh)
-    return f"${usd:,.4f} USD/hr  /  {dzd:,.3f} DZD/hr"
+def fmt_usd_dzd_hr(usd, dzd):
+    return f"${usd/HOURS_IN_YEAR:,.5f} USD/hr  /  {dzd/HOURS_IN_YEAR:,.4f} DZD/hr"
+
+def render_energy_cost_block(label, kwh, cost_fn, icon="⚡"):
+    usd, dzd = cost_fn(kwh)
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"{icon} {label} kWh/yr",    f"{kwh:,.1f}")
+    c2.metric("💵 Cost / Year",            fmt_usd_dzd(usd, dzd))
+    c3.metric("⏱️ Avg Cost / Hour",        fmt_usd_dzd_hr(usd, dzd))
 
 # ─────────────────────────────────────────────
 # JSON EXPORT / IMPORT
 # ─────────────────────────────────────────────
 def export_to_json():
-    return json.dumps(
-        {
-            "building":  st.session_state.building,
-            "floors":    {str(k): v for k, v in st.session_state.floors.items()},
-            "templates": st.session_state.templates,
-        },
-        indent=2,
-    )
+    return json.dumps({
+        "building":  st.session_state.building,
+        "floors":    {str(k): v for k, v in st.session_state.floors.items()},
+        "templates": st.session_state.templates,
+    }, indent=2)
 
 def import_from_json(content):
     try:
@@ -395,46 +476,44 @@ def import_from_json(content):
 # ─────────────────────────────────────────────
 def load_example_building():
     st.session_state.building = {
-        "name":                  "Example Building",
-        "num_floors":            3,
-        "climate_zone":          "Coast",
-        "location_type":         "Urban",
-        "electricity_price_usd": 0.12,
-        "exchange_rate":         135.0,
-        "created_date":          datetime.now().strftime("%Y-%m-%d"),
+        "name": "Example Building", "num_floors": 3,
+        "climate_zone": "Coast", "location_type": "Urban",
+        "electricity_price_usd": 0.12, "gas_price_usd": 0.02,
+        "exchange_rate": 135.0,
+        "created_date": datetime.now().strftime("%Y-%m-%d"),
     }
-    sample_appliances = [
+    elec_appls = [
         {"name": "Refrigerator", "watts": 150,  "hours": 24},
         {"name": "AC (split)",   "watts": 800,  "hours": 8},
         {"name": "TV (LED)",     "watts": 100,  "hours": 5},
     ]
-
+    gas_appls = [
+        {"name": "Gas Stove",        "kwh_per_hour": 1.5, "hours": 1},
+        {"name": "Gas Water Heater", "kwh_per_hour": 3.0, "hours": 1},
+    ]
     def make_room(name, area, appliances):
-        r = default_room(name)
-        r["area_m2"]    = area
-        r["appliances"] = [dict(a) for a in appliances]
-        return r
-
-    def make_apt(apt_name, area_living, area_bed):
+        r = default_room(name); r["area_m2"] = area
+        r["appliances"] = [dict(a) for a in appliances]; return r
+    def make_apt(aname, al, ab):
         return {
-            "name": apt_name,
+            "name": aname, "occupants": 4, "cooking_kwh": 1825.0,
+            "gas_appliances": [dict(a) for a in gas_appls],
             "rooms": {
-                "1": make_room("Living Room", area_living, sample_appliances),
-                "2": make_room("Bedroom",     area_bed,    [{"name": "TV (LED)", "watts": 100, "hours": 5}]),
+                "1": make_room("Living Room", al, elec_appls),
+                "2": make_room("Bedroom",     ab, [{"name":"TV (LED)","watts":100,"hours":5}]),
             },
         }
-
     st.session_state.floors = {
-        1: {"apartments": {"A": make_apt("Apartment 1A", 35, 20), "B": make_apt("Apartment 1B", 30, 18)}},
-        2: {"apartments": {"A": make_apt("Apartment 2A", 35, 20), "B": make_apt("Apartment 2B", 30, 18)}},
-        3: {"apartments": {"A": make_apt("Apartment 3A", 35, 20)}},
+        1: {"apartments": {"A": make_apt("Apartment 1A",35,20), "B": make_apt("Apartment 1B",30,18)}},
+        2: {"apartments": {"A": make_apt("Apartment 2A",35,20), "B": make_apt("Apartment 2B",30,18)}},
+        3: {"apartments": {"A": make_apt("Apartment 3A",35,20)}},
     }
-    st.session_state.current_floor     = 1
+    st.session_state.current_floor = 1
     st.session_state.current_apartment = "A"
-    st.session_state.current_room      = "1"
+    st.session_state.current_room = "1"
 
 # ─────────────────────────────────────────────
-# SIDEBAR — 4-LEVEL HIERARCHY TREE
+# SIDEBAR — 4-LEVEL TREE
 # ─────────────────────────────────────────────
 def render_sidebar():
     with st.sidebar:
@@ -442,242 +521,208 @@ def render_sidebar():
         st.caption("Master Year Project")
         st.divider()
 
-        # ── Top nav buttons ──────────────────
         for icon, pg in [
             ("📈", "Results & Forecast"),
             ("⚙️", "Building Settings"),
-            ("📁", "Apartment Templates"),
+            ("📁", "Room Templates"),
             ("💾", "Save/Load Project"),
             ("❓", "Help"),
         ]:
-            if st.button(
-                f"{icon} {pg}",
-                use_container_width=True,
-                type="primary" if st.session_state.page == pg else "secondary",
-                key=f"nav_{pg}",
-            ):
-                st.session_state.page = pg
-                st.rerun()
+            if st.button(f"{icon} {pg}", use_container_width=True,
+                         type="primary" if st.session_state.page == pg else "secondary",
+                         key=f"nav_{pg}"):
+                st.session_state.page = pg; st.rerun()
 
         st.divider()
-
-        # ── Building label ───────────────────
         b = st.session_state.building
         if st.button(f"🏢  {b['name']}", use_container_width=True, key="nav_bld"):
-            st.session_state.page = "Building Settings"
-            st.rerun()
+            st.session_state.page = "Building Settings"; st.rerun()
         st.caption(f"Zone: {b['climate_zone']}  |  {b['location_type']}")
 
-        # ── Tree ────────────────────────────
         floors     = st.session_state.floors
         floor_nums = sorted(floors.keys())
-
         cf = st.session_state.current_floor
         ca = st.session_state.current_apartment
         cr = st.session_state.current_room
 
         for floor_num in floor_nums:
-            apts           = floors[floor_num]["apartments"]
+            apts            = floors[floor_num]["apartments"]
             is_active_floor = floor_num == cf
 
             with st.expander(
                 f"📐 Floor {floor_num}  ({len(apts)} apt{'s' if len(apts)!=1 else ''})",
                 expanded=is_active_floor,
             ):
-                # ── Per-floor actions ────────
                 fc1, fc2, fc3 = st.columns(3)
                 with fc1:
-                    if st.button("➕ Apt", key=f"add_apt_{floor_num}",
-                                 help="Add apartment", use_container_width=True):
+                    if st.button("➕ Apt", key=f"add_apt_{floor_num}", use_container_width=True):
                         nk = next_apt_key(list(apts.keys()))
                         apts[nk] = default_apartment(f"Apartment {nk}")
                         st.session_state.current_floor     = floor_num
                         st.session_state.current_apartment = nk
-                        st.session_state.current_room      = sorted(apts[nk]["rooms"].keys())[0]
-                        st.session_state.page              = "Dashboard"
-                        st.rerun()
+                        st.session_state.current_room      = "1"
+                        st.session_state.page = "Dashboard"; st.rerun()
                 with fc2:
-                    if st.button("📋 Floor", key=f"copy_floor_{floor_num}",
-                                 help="Duplicate floor", use_container_width=True):
+                    if st.button("📋 Floor", key=f"copy_fl_{floor_num}", use_container_width=True):
                         nf = next_floor_num(floors)
                         floors[nf] = copy.deepcopy(floors[floor_num])
                         st.session_state.building["num_floors"] = len(floors)
-                        st.session_state.current_floor     = nf
-                        first_apt  = sorted(floors[nf]["apartments"].keys())[0]
-                        first_room = sorted(floors[nf]["apartments"][first_apt]["rooms"].keys())[0]
-                        st.session_state.current_apartment = first_apt
-                        st.session_state.current_room      = first_room
-                        st.session_state.page              = "Dashboard"
-                        st.rerun()
+                        fa = sorted(floors[nf]["apartments"].keys())[0]
+                        fr = sorted(floors[nf]["apartments"][fa]["rooms"].keys())[0]
+                        st.session_state.current_floor = nf
+                        st.session_state.current_apartment = fa
+                        st.session_state.current_room = fr
+                        st.session_state.page = "Dashboard"; st.rerun()
                 with fc3:
                     if len(floor_nums) > 1:
-                        if st.button("🗑️ Del", key=f"del_floor_{floor_num}",
-                                     help="Delete floor", use_container_width=True):
+                        if st.button("🗑️ Del", key=f"del_fl_{floor_num}", use_container_width=True):
                             del floors[floor_num]
                             st.session_state.building["num_floors"] = len(floors)
-                            rem       = sorted(floors.keys())
-                            first_apt = sorted(floors[rem[0]]["apartments"].keys())[0]
-                            first_rm  = sorted(floors[rem[0]]["apartments"][first_apt]["rooms"].keys())[0]
-                            st.session_state.current_floor     = rem[0]
-                            st.session_state.current_apartment = first_apt
-                            st.session_state.current_room      = first_rm
-                            st.rerun()
+                            rem  = sorted(floors.keys())
+                            fa   = sorted(floors[rem[0]]["apartments"].keys())[0]
+                            fr   = sorted(floors[rem[0]]["apartments"][fa]["rooms"].keys())[0]
+                            st.session_state.current_floor = rem[0]
+                            st.session_state.current_apartment = fa
+                            st.session_state.current_room = fr; st.rerun()
 
-                # ── Apartments inside this floor ─
                 for apt_key in sorted(apts.keys()):
-                    apt_obj        = apts[apt_key]
-                    rooms          = apt_obj["rooms"]
-                    is_active_apt  = (floor_num == cf and apt_key == ca)
+                    apt_obj       = apts[apt_key]
+                    rooms         = apt_obj["rooms"]
+                    is_active_apt = (floor_num == cf and apt_key == ca)
 
-                    # Apartment row: label + per-apt actions
-                    apt_label = f"{'▶ ' if is_active_apt else '    '}🚪 {apt_key}: {apt_obj['name']}"
-
-                    # Apartment expander (nested via columns + expander trick)
-                    apt_exp_label = (
-                        f"{'▶ ' if is_active_apt else ''}🚪 {apt_key}: {apt_obj['name']}  "
-                        f"({len(rooms)} rm{'s' if len(rooms)!=1 else ''})"
-                    )
-                    with st.expander(apt_exp_label, expanded=is_active_apt):
-
-                        # Per-apt actions
+                    with st.expander(
+                        f"{'▶ ' if is_active_apt else ''}🚪 {apt_key}: {apt_obj['name']}  ({len(rooms)} rm{'s' if len(rooms)!=1 else ''})",
+                        expanded=is_active_apt,
+                    ):
                         ac1, ac2, ac3 = st.columns(3)
                         with ac1:
-                            if st.button("➕ Rm", key=f"add_room_{floor_num}_{apt_key}",
-                                         help="Add room", use_container_width=True):
+                            if st.button("➕ Rm", key=f"add_rm_{floor_num}_{apt_key}", use_container_width=True):
                                 nrk = next_room_key(list(rooms.keys()))
                                 rooms[nrk] = default_room(f"Room {nrk}")
-                                st.session_state.current_floor     = floor_num
+                                st.session_state.current_floor = floor_num
                                 st.session_state.current_apartment = apt_key
-                                st.session_state.current_room      = nrk
-                                st.session_state.page              = "Dashboard"
-                                st.rerun()
+                                st.session_state.current_room = nrk
+                                st.session_state.page = "Dashboard"; st.rerun()
                         with ac2:
-                            if st.button("📋 Apt", key=f"copy_apt_{floor_num}_{apt_key}",
-                                         help="Duplicate apartment to new slot on same floor",
-                                         use_container_width=True):
+                            if st.button("📋 Apt", key=f"copy_apt_{floor_num}_{apt_key}", use_container_width=True):
                                 nk = next_apt_key(list(apts.keys()))
                                 apts[nk] = copy.deepcopy(apt_obj)
                                 apts[nk]["name"] = f"Apartment {nk}"
-                                st.session_state.current_floor     = floor_num
+                                st.session_state.current_floor = floor_num
                                 st.session_state.current_apartment = nk
-                                st.session_state.current_room      = sorted(apts[nk]["rooms"].keys())[0]
-                                st.session_state.page              = "Dashboard"
-                                st.rerun()
+                                st.session_state.current_room = sorted(apts[nk]["rooms"].keys())[0]
+                                st.session_state.page = "Dashboard"; st.rerun()
                         with ac3:
                             if len(apts) > 1:
-                                if st.button("🗑️ Apt", key=f"del_apt_{floor_num}_{apt_key}",
-                                             help="Delete apartment", use_container_width=True):
+                                if st.button("🗑️ Apt", key=f"del_apt_{floor_num}_{apt_key}", use_container_width=True):
                                     del apts[apt_key]
-                                    rem_apt  = sorted(apts.keys())[0]
-                                    rem_rm   = sorted(apts[rem_apt]["rooms"].keys())[0]
-                                    st.session_state.current_floor     = floor_num
-                                    st.session_state.current_apartment = rem_apt
-                                    st.session_state.current_room      = rem_rm
-                                    st.rerun()
+                                    ra  = sorted(apts.keys())[0]
+                                    rr  = sorted(apts[ra]["rooms"].keys())[0]
+                                    st.session_state.current_floor = floor_num
+                                    st.session_state.current_apartment = ra
+                                    st.session_state.current_room = rr; st.rerun()
 
-                        # ── Room buttons ─────────
                         for room_key in sorted(rooms.keys(), key=lambda x: int(x) if x.isdigit() else ord(x[0])):
-                            room_obj    = rooms[room_key]
-                            is_sel_room = (floor_num == cf and apt_key == ca and room_key == cr)
-                            prefix      = "▶ " if is_sel_room else "     "
-                            btn_type    = "primary" if is_sel_room else "secondary"
-
+                            is_sel = (floor_num == cf and apt_key == ca and room_key == cr)
                             if st.button(
-                                f"{prefix}🏠 {room_key}: {room_obj['name']}",
-                                key=f"room_btn_{floor_num}_{apt_key}_{room_key}",
+                                f"{'▶ ' if is_sel else '     '}🏠 {room_key}: {rooms[room_key]['name']}",
+                                key=f"rm_btn_{floor_num}_{apt_key}_{room_key}",
                                 use_container_width=True,
-                                type=btn_type,
+                                type="primary" if is_sel else "secondary",
                             ):
-                                st.session_state.current_floor     = floor_num
+                                st.session_state.current_floor = floor_num
                                 st.session_state.current_apartment = apt_key
-                                st.session_state.current_room      = room_key
-                                st.session_state.page              = "Dashboard"
-                                st.rerun()
+                                st.session_state.current_room = room_key
+                                st.session_state.page = "Dashboard"; st.rerun()
 
         st.divider()
-
-        # ── Add floor ────────────────────────
         if st.button("➕ Add Floor", use_container_width=True, key="add_floor_btn"):
             nf = next_floor_num(floors)
             floors[nf] = {"apartments": {"A": default_apartment("Apartment A")}}
             st.session_state.building["num_floors"] = len(floors)
-            st.session_state.current_floor     = nf
+            st.session_state.current_floor = nf
             st.session_state.current_apartment = "A"
-            st.session_state.current_room      = "1"
-            st.session_state.page              = "Dashboard"
-            st.rerun()
-
+            st.session_state.current_room = "1"
+            st.session_state.page = "Dashboard"; st.rerun()
         st.divider()
-
-        # ── Utilities ────────────────────────
         if st.button("🏗️ Load Example Building", use_container_width=True):
-            load_example_building()
-            st.session_state.page = "Dashboard"
-            st.rerun()
+            load_example_building(); st.session_state.page = "Dashboard"; st.rerun()
         if st.button("🔄 New / Reset Project", use_container_width=True):
             for k in ["building","floors","templates","current_floor","current_apartment","current_room"]:
                 st.session_state.pop(k, None)
             st.rerun()
 
 # ─────────────────────────────────────────────
-# APPLIANCE TABLE  (shared by Dashboard)
+# ELECTRIC APPLIANCE TABLE  (room level)
 # ─────────────────────────────────────────────
-def render_appliance_table(room, key_prefix):
-    """Renders the dynamic appliance editor for a room."""
-    add_c1, add_c2 = st.columns([1, 2])
-    with add_c1:
-        if st.button("➕ Add Blank", use_container_width=True, key=f"blank_{key_prefix}"):
+def render_elec_appliance_table(room, kp):
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("➕ Add Blank", use_container_width=True, key=f"eblank_{kp}"):
             room["appliances"].append({"name": "New Appliance", "watts": 100, "hours": 1})
             st.rerun()
-    with add_c2:
-        preset_names = [t["name"] for t in APPLIANCE_TEMPLATES]
-        psel = st.selectbox(
-            "Preset", ["— select preset —"] + preset_names,
-            key=f"psel_{key_prefix}", label_visibility="collapsed",
-        )
-        if psel != "— select preset —":
-            if st.button("➕ Add Preset", use_container_width=True, key=f"addp_{key_prefix}"):
-                m = next((t for t in APPLIANCE_TEMPLATES if t["name"] == psel), None)
+    with c2:
+        psel = st.selectbox("Preset", ["— select —"] + [t["name"] for t in ELEC_APPLIANCE_TEMPLATES],
+                             key=f"epsel_{kp}", label_visibility="collapsed")
+        if psel != "— select —":
+            if st.button("➕ Add Preset", use_container_width=True, key=f"eaddp_{kp}"):
+                m = next((t for t in ELEC_APPLIANCE_TEMPLATES if t["name"] == psel), None)
                 if m:
                     room["appliances"].append({"name": m["name"], "watts": m["watts"], "hours": m["hours"]})
                     st.rerun()
-
-    appliances = room["appliances"]
-    if appliances:
+    appls = room["appliances"]
+    if appls:
         hcols = st.columns([0.35, 2.1, 1.15, 1.15, 0.75])
         for col, lbl in zip(hcols, ["**#**","**Name**","**Watts**","**Hrs/day**","**Del**"]):
             col.markdown(lbl)
         to_del = None
-        for i, appl in enumerate(appliances):
+        for i, a in enumerate(appls):
             row = st.columns([0.35, 2.1, 1.15, 1.15, 0.75])
-            row[0].write(i + 1)
-            appl["name"]  = row[1].text_input("", value=appl["name"],  key=f"an_{key_prefix}_{i}", label_visibility="collapsed")
-            appl["watts"] = row[2].number_input("", 0, 5000, int(appl["watts"]),  key=f"aw_{key_prefix}_{i}", label_visibility="collapsed")
-            appl["hours"] = row[3].number_input("", 0.0, 24.0, float(appl["hours"]), step=0.5, key=f"ah_{key_prefix}_{i}", label_visibility="collapsed")
-            if row[4].button("🗑️", key=f"ad_{key_prefix}_{i}"):
-                to_del = i
+            row[0].write(i+1)
+            a["name"]  = row[1].text_input("",  value=a["name"],  key=f"ean_{kp}_{i}", label_visibility="collapsed")
+            a["watts"] = row[2].number_input("", 0, 5000, int(a["watts"]),  key=f"eaw_{kp}_{i}", label_visibility="collapsed")
+            a["hours"] = row[3].number_input("", 0.0, 24.0, float(a["hours"]), step=0.5, key=f"eah_{kp}_{i}", label_visibility="collapsed")
+            if row[4].button("🗑️", key=f"ead_{kp}_{i}"): to_del = i
         if to_del is not None:
-            room["appliances"].pop(to_del)
-            st.rerun()
+            room["appliances"].pop(to_del); st.rerun()
     else:
-        st.info("No appliances yet. Add one above.")
+        st.info("No electric appliances yet.")
 
 # ─────────────────────────────────────────────
-# COST METRICS BLOCK  (reusable)
+# GAS APPLIANCE TABLE  (apartment level)
 # ─────────────────────────────────────────────
-def render_cost_metrics(label, kwh):
-    """Renders kWh/yr, cost/yr, cost/hr in a 3-column metric row."""
-    usd_yr, dzd_yr = cost_per_year(kwh)
-    usd_hr, dzd_hr = cost_per_hour(kwh)
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric(f"⚡ {label} — kWh/yr",    f"{kwh:,.1f}")
-    m2.metric("💵 Cost / Year",
-              f"${usd_yr:,.2f} USD",
-              f"{dzd_yr:,.0f} DZD")
-    m3.metric("⏱️ Avg Cost / Hour",
-              f"${usd_hr:,.5f} USD",
-              f"{dzd_hr:,.4f} DZD")
+def render_gas_appliance_table(apt, kp):
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("➕ Add Blank", use_container_width=True, key=f"gblank_{kp}"):
+            apt["gas_appliances"].append({"name": "New Gas Appliance", "kwh_per_hour": 1.0, "hours": 1.0})
+            st.rerun()
+    with c2:
+        gsel = st.selectbox("Preset", ["— select —"] + [t["name"] for t in GAS_APPLIANCE_TEMPLATES],
+                             key=f"gpsel_{kp}", label_visibility="collapsed")
+        if gsel != "— select —":
+            if st.button("➕ Add Preset", use_container_width=True, key=f"gaddp_{kp}"):
+                m = next((t for t in GAS_APPLIANCE_TEMPLATES if t["name"] == gsel), None)
+                if m:
+                    apt["gas_appliances"].append({"name": m["name"], "kwh_per_hour": m["kwh_per_hour"], "hours": m["hours"]})
+                    st.rerun()
+    gappls = apt["gas_appliances"]
+    if gappls:
+        hcols = st.columns([0.35, 2.1, 1.4, 1.15, 0.75])
+        for col, lbl in zip(hcols, ["**#**","**Name**","**kWh/hr**","**Hrs/day**","**Del**"]):
+            col.markdown(lbl)
+        to_del = None
+        for i, a in enumerate(gappls):
+            row = st.columns([0.35, 2.1, 1.4, 1.15, 0.75])
+            row[0].write(i+1)
+            a["name"]         = row[1].text_input("",  value=a["name"],          key=f"gan_{kp}_{i}", label_visibility="collapsed")
+            a["kwh_per_hour"] = row[2].number_input("", 0.0, 50.0, float(a["kwh_per_hour"]), step=0.1, key=f"gakph_{kp}_{i}", label_visibility="collapsed")
+            a["hours"]        = row[3].number_input("", 0.0, 24.0, float(a["hours"]),        step=0.5, key=f"gah_{kp}_{i}",   label_visibility="collapsed")
+            if row[4].button("🗑️", key=f"gad_{kp}_{i}"): to_del = i
+        if to_del is not None:
+            apt["gas_appliances"].pop(to_del); st.rerun()
+    else:
+        st.info("No gas appliances yet.")
 
 # ─────────────────────────────────────────────
 # PAGE: DASHBOARD
@@ -689,8 +734,7 @@ def page_dashboard():
     cr = st.session_state.current_room
 
     # Safety guards
-    if cf not in floors:
-        cf = sorted(floors.keys())[0]; st.session_state.current_floor = cf
+    if cf not in floors: cf = sorted(floors.keys())[0]; st.session_state.current_floor = cf
     if ca not in floors[cf]["apartments"]:
         ca = sorted(floors[cf]["apartments"].keys())[0]; st.session_state.current_apartment = ca
     if cr not in floors[cf]["apartments"][ca]["rooms"]:
@@ -698,172 +742,167 @@ def page_dashboard():
 
     apt  = floors[cf]["apartments"][ca]
     room = apt["rooms"][cr]
+    kp   = f"{cf}_{ca}_{cr}"   # unique key prefix
 
-    # ── Header ──────────────────────────────
     st.title("🏢 Building Energy Forecaster")
     st.markdown(
-        f"**Editing:** Floor {cf}  ›  Apartment {ca} (*{apt['name']}*)  ›  "
-        f"Room {cr} (*{room['name']}*)  |  "
+        f"**Editing:** Floor {cf} › Apt {ca} (*{apt['name']}*) › Room {cr} (*{room['name']}*)  |  "
         f"Climate: **{st.session_state.building['climate_zone']}**  |  "
         f"Location: **{st.session_state.building['location_type']}**"
     )
     st.divider()
 
-    # ── Template toolbar ─────────────────────
-    tb1, tb2, tb3, tb4 = st.columns([2, 2, 2, 2])
+    # Template toolbar
+    tb1, tb2, tb3, tb4 = st.columns(4)
     with tb1:
-        tpl_name_input = st.text_input(
-            "Template name", value=f"F{cf}_Apt{ca}_Rm{cr}",
-            placeholder="Template name…", label_visibility="collapsed",
-            key="tpl_name_inp",
-        )
+        tpl_inp = st.text_input("", value=f"F{cf}_Apt{ca}_Rm{cr}", placeholder="Template name…",
+                                 label_visibility="collapsed", key="tpl_name_inp")
     with tb2:
         if st.button("💾 Save Room as Template", use_container_width=True):
-            if tpl_name_input.strip():
-                st.session_state.templates[tpl_name_input] = copy.deepcopy(room)
-                st.success(f"Saved: **{tpl_name_input}**")
-            else:
-                st.error("Enter a template name first.")
+            if tpl_inp.strip():
+                st.session_state.templates[tpl_inp] = copy.deepcopy(room)
+                st.success(f"Saved: **{tpl_inp}**")
+            else: st.error("Enter a template name first.")
     with tb3:
-        if st.session_state.templates:
-            tpl_sel = st.selectbox(
-                "Load", ["— select —"] + list(st.session_state.templates.keys()),
-                key="tpl_sel", label_visibility="collapsed",
-            )
-        else:
-            tpl_sel = "— select —"
-            st.caption("No templates yet.")
+        tpl_sel = st.selectbox("", ["— select —"] + list(st.session_state.templates.keys()),
+                                key="tpl_sel", label_visibility="collapsed") if st.session_state.templates else "— select —"
+        if not st.session_state.templates: st.caption("No templates yet.")
     with tb4:
         if tpl_sel != "— select —":
             if st.button("⬇️ Apply Template", use_container_width=True):
                 room.update(copy.deepcopy(st.session_state.templates[tpl_sel]))
-                st.success(f"Applied: **{tpl_sel}**")
-                st.rerun()
+                st.success(f"Applied: **{tpl_sel}**"); st.rerun()
 
     st.divider()
 
-    # ── Room name ────────────────────────────
-    room["name"] = st.text_input("Room name", value=room["name"], key=f"rname_{cf}_{ca}_{cr}")
+    # ── Tabs: Electricity | Gas ──────────────
+    tab_elec, tab_gas = st.tabs(["⚡ Electricity", "🔥 Gas"])
 
-    # ── Two-column layout ────────────────────
-    left_col, right_col = st.columns([1, 1], gap="large")
+    # ════════════ ELECTRICITY TAB ════════════
+    with tab_elec:
+        room["name"] = st.text_input("Room name", value=room["name"], key=f"rname_{kp}")
+        left, right = st.columns([1, 1], gap="large")
 
-    # ════════════════════════════════════════
-    # LEFT — Room physical inputs
-    # ════════════════════════════════════════
-    with left_col:
-        st.subheader("🧱 Room Shell")
-        c1, c2 = st.columns(2)
-        with c1:
-            room["area_m2"] = st.number_input(
-                "Floor area (m²)", 5.0, 100.0, float(room["area_m2"]),
-                step=0.5, key=f"area_{cf}_{ca}_{cr}"
-            )
-            room["wall_thickness_cm"] = st.slider(
-                "Wall thickness (cm)", 10, 50, int(room["wall_thickness_cm"]),
-                key=f"wt_{cf}_{ca}_{cr}"
-            )
-            room["wall_material"] = st.selectbox(
-                "Wall material", list(WALL_U_VALUES.keys()),
-                index=list(WALL_U_VALUES.keys()).index(room.get("wall_material","Brick")),
-                key=f"wm_{cf}_{ca}_{cr}",
-            )
-            st.caption(f"U-value: {WALL_U_VALUES[room['wall_material']]} W/m²K")
+        with left:
+            st.subheader("🧱 Room Shell")
+            c1, c2 = st.columns(2)
+            with c1:
+                room["area_m2"] = st.number_input("Floor area (m²)", 5.0, 100.0, float(room["area_m2"]), step=0.5, key=f"area_{kp}")
+                room["wall_thickness_cm"] = st.slider("Wall thickness (cm)", 10, 50, int(room["wall_thickness_cm"]), key=f"wt_{kp}")
+                room["wall_material"] = st.selectbox("Wall material", list(WALL_U_VALUES.keys()),
+                    index=list(WALL_U_VALUES.keys()).index(room.get("wall_material","Brick")), key=f"wm_{kp}")
+                st.caption(f"U-value: {WALL_U_VALUES[room['wall_material']]} W/m²K")
+            with c2:
+                room["ceiling_height_m"] = st.number_input("Ceiling height (m)", 2.0, 4.0, float(room["ceiling_height_m"]), step=0.1, key=f"ch_{kp}")
+                room["window_count"] = st.number_input("Window count", 0, 20, int(room["window_count"]), key=f"wc_{kp}")
+                room["window_area_per_window_m2"] = st.number_input("Window area each (m²)", 0.5, 5.0, float(room["window_area_per_window_m2"]), step=0.1, key=f"wa_{kp}")
+                room["window_type"] = st.selectbox("Window type", ["Single","Double"],
+                    index=["Single","Double"].index(room.get("window_type","Single")), key=f"wtype_{kp}")
+                st.caption(f"Window U-value: {WINDOW_U_VALUES[room['window_type']]} W/m²K")
+                room["plug_count"] = st.number_input("Plug/outlet count", 0, 30, int(room["plug_count"]), key=f"pc_{kp}")
 
-        with c2:
-            room["ceiling_height_m"] = st.number_input(
-                "Ceiling height (m)", 2.0, 4.0, float(room["ceiling_height_m"]),
-                step=0.1, key=f"ch_{cf}_{ca}_{cr}"
-            )
-            room["window_count"] = st.number_input(
-                "Window count", 0, 20, int(room["window_count"]),
-                key=f"wc_{cf}_{ca}_{cr}"
-            )
-            room["window_area_per_window_m2"] = st.number_input(
-                "Window area each (m²)", 0.5, 5.0,
-                float(room["window_area_per_window_m2"]),
-                step=0.1, key=f"wa_{cf}_{ca}_{cr}"
-            )
-            room["window_type"] = st.selectbox(
-                "Window type", ["Single","Double"],
-                index=["Single","Double"].index(room.get("window_type","Single")),
-                key=f"wtype_{cf}_{ca}_{cr}",
-            )
-            st.caption(f"Window U-value: {WINDOW_U_VALUES[room['window_type']]} W/m²K")
-            room["plug_count"] = st.number_input(
-                "Plug/outlet count", 0, 30, int(room["plug_count"]),
-                key=f"pc_{cf}_{ca}_{cr}"
-            )
+            # Copy room
+            st.subheader("📋 Copy Room To…")
+            cp1, cp2, cp3, cp4 = st.columns([2,2,2,1])
+            with cp1: tgt_fl = st.selectbox("Floor", sorted(floors.keys()), key=f"cpf_{kp}")
+            with cp2:
+                tgt_apt_opts = sorted(floors[tgt_fl]["apartments"].keys())
+                tgt_apt = st.selectbox("Apt", tgt_apt_opts, key=f"cpa_{kp}")
+            with cp3:
+                tgt_rm_opts = sorted(floors[tgt_fl]["apartments"][tgt_apt]["rooms"].keys()) + ["NEW"]
+                tgt_rm = st.selectbox("Room", tgt_rm_opts, key=f"cpr_{kp}")
+            with cp4:
+                st.write(""); st.write("")
+                if st.button("📤", key=f"docopy_{kp}", use_container_width=True):
+                    dest = floors[tgt_fl]["apartments"][tgt_apt]["rooms"]
+                    nrk  = next_room_key(list(dest.keys())) if tgt_rm == "NEW" else tgt_rm
+                    dest[nrk] = copy.deepcopy(room)
+                    st.success(f"Copied → Fl {tgt_fl} / Apt {tgt_apt} / Rm {nrk}"); st.rerun()
 
-        # ── Copy room ────────────────────────
-        st.subheader("📋 Copy Room To…")
-        cp1, cp2, cp3, cp4 = st.columns([2, 2, 2, 1])
-        with cp1:
-            tgt_floor = st.selectbox("Floor", sorted(floors.keys()), key=f"cpf_{cf}_{ca}_{cr}")
-        with cp2:
-            tgt_apt_opts = sorted(floors[tgt_floor]["apartments"].keys())
-            tgt_apt = st.selectbox("Apt", tgt_apt_opts, key=f"cpa_{cf}_{ca}_{cr}")
-        with cp3:
-            tgt_room_opts = sorted(floors[tgt_floor]["apartments"][tgt_apt]["rooms"].keys()) + ["NEW"]
-            tgt_room = st.selectbox("Room", tgt_room_opts, key=f"cpr_{cf}_{ca}_{cr}")
-        with cp4:
-            st.write(""); st.write("")
-            if st.button("📤", key=f"do_copy_{cf}_{ca}_{cr}", use_container_width=True, help="Copy room"):
-                dest_rooms = floors[tgt_floor]["apartments"][tgt_apt]["rooms"]
-                if tgt_room == "NEW":
-                    nrk = next_room_key(list(dest_rooms.keys()))
-                    dest_rooms[nrk] = copy.deepcopy(room)
-                    st.success(f"Copied → Floor {tgt_floor} / Apt {tgt_apt} / Room {nrk}")
-                else:
-                    dest_rooms[tgt_room] = copy.deepcopy(room)
-                    st.success(f"Copied → Floor {tgt_floor} / Apt {tgt_apt} / Room {tgt_room}")
-                st.rerun()
+            if len(apt["rooms"]) > 1:
+                st.divider()
+                if st.button(f"🗑️ Delete Room {cr}: {room['name']}", use_container_width=True, key=f"delrm_{kp}"):
+                    del apt["rooms"][cr]
+                    st.session_state.current_room = sorted(apt["rooms"].keys())[0]; st.rerun()
 
-        # ── Delete room ──────────────────────
-        if len(apt["rooms"]) > 1:
+        with right:
+            st.subheader("⚡ Electric Appliances")
+            render_elec_appliance_table(room, kp)
             st.divider()
-            if st.button(f"🗑️ Delete Room {cr}: {room['name']}", use_container_width=True,
-                         key=f"del_room_{cf}_{ca}_{cr}"):
-                del apt["rooms"][cr]
-                st.session_state.current_room = sorted(apt["rooms"].keys())[0]
-                st.rerun()
+            st.subheader("📊 Quick Results — Electricity")
+            er = calculate_room_electricity(room, st.session_state.building["climate_zone"], st.session_state.building["location_type"])
+            render_energy_cost_block("Room Elec", er["total"], elec_cost, "⚡")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("🌡️ Cooling",    f"{er['wall_load']+er['window_load']:,.0f} kWh")
+            m2.metric("⚡ Appliances", f"{er['appliance_total']:,.0f} kWh")
+            m3.metric("🔌 Plug Load",  f"{er['plug_load']:,.0f} kWh")
+            m4.metric("📐 Area",       f"{er['area_m2']:.0f} m²")
+            st.divider()
+            apt_er = calculate_apartment_electricity(apt, st.session_state.building["climate_zone"], st.session_state.building["location_type"])
+            st.markdown(f"**🚪 Apartment {ca} — Electricity Total ({len(apt['rooms'])} rooms)**")
+            render_energy_cost_block("Apt Elec", apt_er["total"], elec_cost, "⚡")
 
-    # ════════════════════════════════════════
-    # RIGHT — Appliances + Quick Results
-    # ════════════════════════════════════════
-    with right_col:
-        st.subheader("⚡ Appliances")
-        render_appliance_table(room, f"{cf}_{ca}_{cr}")
+    # ════════════ GAS TAB ════════════════════
+    with tab_gas:
+        st.subheader(f"🔥 Gas Settings — Apartment {ca}: {apt['name']}")
+        st.caption("Gas inputs are set at the apartment level (heating is summed from all rooms).")
+
+        g1, g2 = st.columns(2)
+        with g1:
+            apt["occupants"] = st.number_input(
+                "Number of occupants", 1, 20, int(apt.get("occupants", 4)),
+                help="Used for hot water gas calculation (occupants × 1,095 kWh/year)",
+                key=f"occ_{cf}_{ca}"
+            )
+            apt["cooking_kwh"] = st.number_input(
+                "Cooking gas (kWh/year)", 0.0, 10000.0, float(apt.get("cooking_kwh", 1825.0)),
+                step=50.0,
+                help="Default 1,825 kWh/year for a family of 4",
+                key=f"cook_{cf}_{ca}"
+            )
+        with g2:
+            st.info(
+                f"🌡️ **Gas heating climate factor:**  "
+                f"{CLIMATE_ZONES[st.session_state.building['climate_zone']]['gas_heating']}  "
+                f"(Zone: {st.session_state.building['climate_zone']})\n\n"
+                f"🏠 **Heater efficiency:** {HEATER_EFF*100:.0f}%\n\n"
+                f"📅 **Degree-days:** {DEGREE_DAYS}"
+            )
+
+        st.subheader("🔥 Gas Appliances")
+        render_gas_appliance_table(apt, f"{cf}_{ca}")
 
         st.divider()
-        st.subheader("📊 Quick Results")
+        st.subheader("📊 Quick Results — Gas")
+        gr = calculate_apartment_gas(apt, st.session_state.building["climate_zone"])
 
-        # Room results
-        res_room = calculate_room_electricity(
-            room,
-            st.session_state.building["climate_zone"],
-            st.session_state.building["location_type"],
-        )
-        st.markdown("**🏠 This Room**")
-        render_cost_metrics("Room", res_room["total"])
+        render_energy_cost_block("Apt Gas Total", gr["total"], gas_cost, "🔥")
 
-        cooling = res_room["wall_load"] + res_room["window_load"]
-        rm1, rm2, rm3, rm4 = st.columns(4)
-        rm1.metric("🌡️ Cooling",    f"{cooling:,.0f} kWh")
-        rm2.metric("⚡ Appliances", f"{res_room['appliance_total']:,.0f} kWh")
-        rm3.metric("🔌 Plug Load",  f"{res_room['plug_load']:,.0f} kWh")
-        rm4.metric("📐 Area",       f"{res_room['area_m2']:.0f} m²")
+        gm1, gm2, gm3, gm4 = st.columns(4)
+        gm1.metric("🌡️ Heating",    f"{gr['heating']:,.0f} kWh/yr")
+        gm2.metric("🚿 Hot Water",  f"{gr['hot_water']:,.0f} kWh/yr")
+        gm3.metric("🍳 Cooking",    f"{gr['cooking']:,.0f} kWh/yr")
+        gm4.metric("🔥 Gas Appls",  f"{gr['gas_appliances']:,.0f} kWh/yr")
 
         st.divider()
+        st.subheader("⚡🔥 Combined — This Apartment")
+        apt_er2 = calculate_apartment_electricity(apt, st.session_state.building["climate_zone"], st.session_state.building["location_type"])
+        combined = apt_er2["total"] + gr["total"]
+        elec_pct = (apt_er2["total"] / combined * 100) if combined > 0 else 0
+        gas_pct  = (gr["total"]      / combined * 100) if combined > 0 else 0
 
-        # Apartment results (sum of all rooms)
-        res_apt = calculate_apartment_total(
-            apt,
-            st.session_state.building["climate_zone"],
-            st.session_state.building["location_type"],
-        )
-        st.markdown(f"**🚪 Apartment {ca} Total ({len(apt['rooms'])} rooms)**")
-        render_cost_metrics("Apartment", res_apt["total"])
+        cm1, cm2, cm3 = st.columns(3)
+        cm1.metric("⚡ Electricity",  f"{apt_er2['total']:,.0f} kWh/yr  ({elec_pct:.1f}%)")
+        cm2.metric("🔥 Gas",          f"{gr['total']:,.0f} kWh/yr  ({gas_pct:.1f}%)")
+        cm3.metric("🏠 Combined",     f"{combined:,.0f} kWh/yr")
+
+        # Argentina benchmark comparison
+        st.markdown("#### 📊 vs Argentina Study Benchmark (88% Gas / 12% Electricity)")
+        bm1, bm2, bm3, bm4 = st.columns(4)
+        bm1.metric("Your Gas %",      f"{gas_pct:.1f}%",   f"{gas_pct - ARG_GAS_SHARE*100:+.1f}% vs benchmark")
+        bm2.metric("Your Elec %",     f"{elec_pct:.1f}%",  f"{elec_pct - ARG_ELEC_SHARE*100:+.1f}% vs benchmark")
+        bm3.metric("Benchmark Gas",   f"{ARG_GAS_SHARE*100:.0f}%")
+        bm4.metric("Benchmark Elec",  f"{ARG_ELEC_SHARE*100:.0f}%")
 
 # ─────────────────────────────────────────────
 # PAGE: BUILDING SETTINGS
@@ -875,38 +914,32 @@ def page_building_settings():
     c1, c2 = st.columns(2)
     with c1:
         b["name"] = st.text_input("Building name", value=b["name"])
-        b["climate_zone"] = st.selectbox(
-            "Climate zone", list(CLIMATE_ZONES.keys()),
-            index=list(CLIMATE_ZONES.keys()).index(b.get("climate_zone","Coast")),
-        )
+        b["climate_zone"] = st.selectbox("Climate zone", list(CLIMATE_ZONES.keys()),
+            index=list(CLIMATE_ZONES.keys()).index(b.get("climate_zone","Coast")))
         zi = CLIMATE_ZONES[b["climate_zone"]]
-        st.caption(f"ℹ️ {zi['desc']}  |  Cooling ×{zi['cooling']}  |  Heating ×{zi['heating']}")
-        b["location_type"] = st.selectbox(
-            "Location type", list(LOCATION_MULTIPLIERS.keys()),
-            index=list(LOCATION_MULTIPLIERS.keys()).index(b.get("location_type","Urban")),
-        )
+        st.caption(f"ℹ️ {zi['desc']}  |  Elec cooling ×{zi['elec_cooling']}  |  Gas heating ×{zi['gas_heating']}")
+        b["location_type"] = st.selectbox("Location type", list(LOCATION_MULTIPLIERS.keys()),
+            index=list(LOCATION_MULTIPLIERS.keys()).index(b.get("location_type","Urban")))
         st.caption(f"ℹ️ Location multiplier: ×{LOCATION_MULTIPLIERS[b['location_type']]}")
 
     with c2:
-        st.subheader("💵 Cost Settings")
+        st.subheader("💵 Energy Prices")
         b["electricity_price_usd"] = st.number_input(
-            "Electricity price (USD/kWh)", 0.01, 1.0,
-            float(b.get("electricity_price_usd", 0.12)),
-            step=0.001, format="%.3f",
-        )
+            "Electricity price (USD/kWh)", 0.001, 2.0,
+            float(b.get("electricity_price_usd", 0.12)), step=0.001, format="%.3f")
+        b["gas_price_usd"] = st.number_input(
+            "Gas price (USD/kWh)", 0.001, 1.0,
+            float(b.get("gas_price_usd", 0.02)), step=0.001, format="%.3f",
+            help="Default $0.02/kWh — Algeria subsidized rate")
         b["exchange_rate"] = st.number_input(
             "Exchange rate (1 USD = ? DZD)", 1.0, 10000.0,
-            float(b.get("exchange_rate", 135.0)), step=1.0,
-        )
-        dzd_eq = b["electricity_price_usd"] * b["exchange_rate"]
-        st.caption(f"≈ {dzd_eq:.2f} DZD / kWh")
-        st.session_state.show_cost = st.checkbox(
-            "Show cost estimates in results", value=st.session_state.show_cost
-        )
+            float(b.get("exchange_rate", 135.0)), step=1.0)
+        dzd_e = b["electricity_price_usd"] * b["exchange_rate"]
+        dzd_g = b["gas_price_usd"]         * b["exchange_rate"]
+        st.caption(f"Electricity: ≈ {dzd_e:.2f} DZD/kWh  |  Gas: ≈ {dzd_g:.2f} DZD/kWh")
+        st.session_state.show_cost = st.checkbox("Show cost estimates in results", value=st.session_state.show_cost)
 
     st.divider()
-
-    # Copy floor
     st.subheader("📋 Copy Entire Floor")
     fnums = sorted(st.session_state.floors.keys())
     if len(fnums) >= 2:
@@ -917,86 +950,68 @@ def page_building_settings():
             st.write(""); st.write("")
             if st.button(f"📤 Copy {src} → {tgt}", use_container_width=True):
                 st.session_state.floors[tgt] = copy.deepcopy(st.session_state.floors[src])
-                st.success(f"Floor {src} copied to Floor {tgt}!")
-                st.rerun()
+                st.success(f"Floor {src} copied to Floor {tgt}!"); st.rerun()
     else:
         st.info("Need at least 2 floors to copy.")
 
     st.divider()
-
-    # Overview
     st.subheader("🏗️ Building Overview")
     for fn in fnums:
-        apts = st.session_state.floors[fn]["apartments"]
-        for ak, av in sorted(apts.items()):
+        for ak, av in sorted(st.session_state.floors[fn]["apartments"].items()):
             rooms     = av["rooms"]
             room_list = ", ".join([f"{rk}:{rv['name']}" for rk,rv in sorted(rooms.items())])
-            st.write(f"  Floor **{fn}** › Apt **{ak}** ({av['name']}) — {len(rooms)} room(s): {room_list}")
+            st.write(f"  Floor **{fn}** › Apt **{ak}** ({av['name']}, {av.get('occupants',4)} occupants) — {len(rooms)} room(s): {room_list}")
 
-    with st.expander("📖 U-Value Reference"):
+    with st.expander("📖 U-Value & Multiplier Reference"):
         st.markdown("**Wall Materials**")
-        wdf = pd.DataFrame([
+        st.dataframe(pd.DataFrame([
             {"Material": k, "U-value (W/m²K)": v,
              "Rating": "Excellent" if v<0.5 else "Good" if v<1.0 else "Average" if v<1.7 else "Poor"}
             for k, v in WALL_U_VALUES.items()
-        ])
-        st.dataframe(wdf, use_container_width=True, hide_index=True)
-        st.markdown("**Window Types**")
-        st.dataframe(
-            pd.DataFrame([{"Type":k,"U-value (W/m²K)":v} for k,v in WINDOW_U_VALUES.items()]),
-            use_container_width=True, hide_index=True,
-        )
+        ]), use_container_width=True, hide_index=True)
+        st.markdown("**Climate Zone Multipliers**")
+        st.dataframe(pd.DataFrame([
+            {"Zone": k, "Elec Cooling ×": v["elec_cooling"],
+             "Elec Heating ×": v["elec_heating"], "Gas Heating ×": v["gas_heating"], "Description": v["desc"]}
+            for k, v in CLIMATE_ZONES.items()
+        ]), use_container_width=True, hide_index=True)
 
 # ─────────────────────────────────────────────
-# PAGE: APARTMENT TEMPLATES
+# PAGE: ROOM TEMPLATES
 # ─────────────────────────────────────────────
 def page_templates():
     st.title("📁 Room Templates")
-
     if not st.session_state.templates:
         st.info("No templates saved yet. Go to the Dashboard and click 'Save Room as Template'.")
         return
-
     for tpl_name, tpl_data in list(st.session_state.templates.items()):
         with st.expander(f"📄 {tpl_name}"):
             tc1, tc2 = st.columns([3, 1])
             with tc1:
-                st.write(
-                    f"**Area:** {tpl_data.get('area_m2','—')} m²  |  "
-                    f"**Wall:** {tpl_data.get('wall_material','—')}  |  "
-                    f"**Windows:** {tpl_data.get('window_count','—')} × {tpl_data.get('window_type','—')}"
-                )
+                st.write(f"**Area:** {tpl_data.get('area_m2','—')} m²  |  **Wall:** {tpl_data.get('wall_material','—')}  |  "
+                         f"**Windows:** {tpl_data.get('window_count','—')} × {tpl_data.get('window_type','—')}")
                 appls = tpl_data.get("appliances", [])
-                if appls:
-                    st.write(f"**Appliances ({len(appls)}):** " + ", ".join([a["name"] for a in appls]))
+                if appls: st.write(f"**Appliances ({len(appls)}):** " + ", ".join([a["name"] for a in appls]))
             with tc2:
                 nn = st.text_input("Rename", value=tpl_name, key=f"ren_{tpl_name}")
                 if nn != tpl_name and st.button("💾", key=f"savren_{tpl_name}"):
-                    st.session_state.templates[nn] = st.session_state.templates.pop(tpl_name)
-                    st.rerun()
+                    st.session_state.templates[nn] = st.session_state.templates.pop(tpl_name); st.rerun()
                 if st.button("🗑️ Delete", key=f"dtpl_{tpl_name}"):
-                    del st.session_state.templates[tpl_name]
-                    st.rerun()
-
+                    del st.session_state.templates[tpl_name]; st.rerun()
     st.divider()
-    st.subheader("📤 Export / Import")
     ec1, ec2 = st.columns(2)
     with ec1:
-        st.download_button(
-            "⬇️ Export Templates (JSON)",
+        st.download_button("⬇️ Export Templates (JSON)",
             data=json.dumps(st.session_state.templates, indent=2),
-            file_name="templates.json", mime="application/json",
-        )
+            file_name="templates.json", mime="application/json")
     with ec2:
         upl = st.file_uploader("⬆️ Import Templates (JSON)", type=["json"], key="tpl_imp")
         if upl:
             try:
                 imp = json.load(upl)
                 st.session_state.templates.update(imp)
-                st.success(f"Imported {len(imp)} template(s).")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Import failed: {e}")
+                st.success(f"Imported {len(imp)} template(s)."); st.rerun()
+            except Exception as e: st.error(f"Import failed: {e}")
 
 # ─────────────────────────────────────────────
 # PAGE: RESULTS & FORECAST
@@ -1004,134 +1019,167 @@ def page_templates():
 def page_results():
     st.title("📈 Results & Forecast")
     b       = st.session_state.building
-    results = calculate_building_total(
-        st.session_state.floors, b["climate_zone"], b["location_type"]
-    )
+    results = calculate_building_total(st.session_state.floors, b["climate_zone"], b["location_type"])
 
-    bldg_kwh = results["building_total"]
-    eui      = results["eui"]
-    bench    = get_eui_benchmark(eui)
+    elec_kwh  = results["building_elec"]
+    gas_kwh   = results["building_gas"]
+    total_kwh = results["total_energy"]
+    eui_e     = results["eui_elec"]
+    eui_t     = results["eui_total"]
+    bench     = get_eui_benchmark(eui_e)
 
-    # ── Building KPIs ────────────────────────
+    elec_pct = (elec_kwh / total_kwh * 100) if total_kwh > 0 else 0
+    gas_pct  = (gas_kwh  / total_kwh * 100) if total_kwh > 0 else 0
+
+    # ── Building summary KPIs ─────────────────
+    st.subheader("🏢 Building Summary")
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("🏢 Total kWh/yr",   f"{bldg_kwh:,.0f}")
-    k2.metric("📐 EUI",            f"{eui:,.1f} kWh/m²/yr")
-    k3.metric("📏 Total Area",     f"{results['total_area']:,.0f} m²")
-    k4.metric("🌍 Climate Zone",   b["climate_zone"])
-    st.info(f"🔍 EUI Benchmark: **{bench}**")
+    k1.metric("⚡ Electricity",   f"{elec_kwh:,.0f} kWh/yr  ({elec_pct:.1f}%)")
+    k2.metric("🔥 Gas",           f"{gas_kwh:,.0f} kWh/yr  ({gas_pct:.1f}%)")
+    k3.metric("🏠 Total Energy",  f"{total_kwh:,.0f} kWh/yr")
+    k4.metric("📐 EUI (Elec)",    f"{eui_e:,.1f} kWh/m²/yr")
+    st.info(f"🔍 Electricity EUI Benchmark: **{bench}**  |  Total EUI: **{eui_t:,.1f} kWh/m²/yr**")
 
-    # Building cost (year + hour)
-    usd_yr, dzd_yr = cost_per_year(bldg_kwh)
-    usd_hr, dzd_hr = cost_per_hour(bldg_kwh)
+    # Building costs
+    eu, ed = elec_cost(elec_kwh); gu, gd = gas_cost(gas_kwh)
+    tu, td = eu + gu, ed + gd
     bc1, bc2, bc3 = st.columns(3)
-    bc1.metric("💵 Building Cost / Year",  f"${usd_yr:,.2f} USD", f"{dzd_yr:,.0f} DZD")
-    bc2.metric("⏱️ Building Avg Cost / Hr", f"${usd_hr:,.5f} USD", f"{dzd_hr:,.4f} DZD")
-    bc3.metric("🔢 Total kWh / Year",      f"{bldg_kwh:,.1f} kWh")
+    bc1.metric("⚡ Electricity Cost/yr", fmt_usd_dzd(eu, ed))
+    bc2.metric("🔥 Gas Cost/yr",        fmt_usd_dzd(gu, gd))
+    bc3.metric("🏠 Total Cost/yr",      fmt_usd_dzd(tu, td))
+    bh1, bh2, bh3 = st.columns(3)
+    bh1.metric("⚡ Elec Avg/hr",  fmt_usd_dzd_hr(eu, ed))
+    bh2.metric("🔥 Gas Avg/hr",   fmt_usd_dzd_hr(gu, gd))
+    bh3.metric("🏠 Total Avg/hr", fmt_usd_dzd_hr(tu, td))
 
     st.divider()
 
-    # ── Floor bar chart ───────────────────────
-    st.subheader("📊 Energy by Floor")
-    fdf = pd.DataFrame([
-        {"Floor": f"Floor {k}", "kWh/year": round(v, 1)}
-        for k, v in sorted(results["floor_totals"].items())
-    ])
-    st.bar_chart(fdf.set_index("Floor"))
+    # ── Argentina benchmark ───────────────────
+    st.subheader("📊 Argentina Study Benchmark (88% Gas / 12% Electricity)")
+    ab1, ab2, ab3, ab4 = st.columns(4)
+    ab1.metric("Your Gas Share",   f"{gas_pct:.1f}%",  f"{gas_pct  - ARG_GAS_SHARE*100:+.1f}% vs 88%")
+    ab2.metric("Your Elec Share",  f"{elec_pct:.1f}%", f"{elec_pct - ARG_ELEC_SHARE*100:+.1f}% vs 12%")
+    ab3.metric("Benchmark Gas",    f"{ARG_GAS_SHARE*100:.0f}%")
+    ab4.metric("Benchmark Elec",   f"{ARG_ELEC_SHARE*100:.0f}%")
+    if gas_pct > ARG_GAS_SHARE * 100:
+        st.warning(f"⚠️ Your gas share ({gas_pct:.1f}%) is higher than the Argentina benchmark ({ARG_GAS_SHARE*100:.0f}%). Consider improving insulation or switching to more efficient heating.")
+    elif elec_pct > ARG_ELEC_SHARE * 100:
+        st.info(f"ℹ️ Your electricity share ({elec_pct:.1f}%) is higher than the Argentina benchmark ({ARG_ELEC_SHARE*100:.0f}%). This is typical for hot/coastal climates with high AC usage.")
+    else:
+        st.success("✅ Your energy split is close to the Argentina benchmark.")
 
-    # ── Apartment breakdown table ─────────────
+    st.divider()
+
+    # ── Floor charts ──────────────────────────
+    st.subheader("📊 Energy by Floor")
+    floor_df = pd.DataFrame([
+        {"Floor": f"Floor {k}", "Electricity (kWh)": round(results["floor_elec"][k], 1),
+         "Gas (kWh)": round(results["floor_gas"][k], 1)}
+        for k in sorted(results["floor_elec"].keys())
+    ])
+    st.bar_chart(floor_df.set_index("Floor"))
+
+    # ── Apartment table ───────────────────────
     st.subheader("🚪 Energy by Apartment")
     apt_rows = []
     for (fn, ak), ar in sorted(results["apt_results"].items()):
         apt_obj = st.session_state.floors[fn]["apartments"][ak]
-        n_rooms = len(apt_obj["rooms"])
-        usd_y, dzd_y = cost_per_year(ar["total"])
-        usd_h, dzd_h = cost_per_hour(ar["total"])
-        row = {
-            "Floor":             fn,
-            "Apt":               ak,
-            "Name":              apt_obj["name"],
-            "Rooms":             n_rooms,
-            "Area (m²)":         round(ar["total_area"], 1),
-            "kWh/yr":            round(ar["total"], 1),
-            "EUI (kWh/m²)":      round(ar["total"] / ar["total_area"], 1) if ar["total_area"] > 0 else 0,
-            "Cost/yr (USD)":     round(usd_y, 2),
-            "Cost/yr (DZD)":     round(dzd_y, 0),
-            "Avg Cost/hr (USD)": round(usd_h, 5),
-            "Avg Cost/hr (DZD)": round(dzd_h, 4),
-        }
-        apt_rows.append(row)
+        ek = ar["elec"]["total"]; gk = ar["gas"]["total"]; tk = ek + gk
+        eu2, ed2 = elec_cost(ek); gu2, gd2 = gas_cost(gk); tcu, tcd = eu2+gu2, ed2+gd2
+        apt_rows.append({
+            "Floor": fn, "Apt": ak, "Name": apt_obj["name"],
+            "Rooms": len(apt_obj["rooms"]),
+            "Occupants": apt_obj.get("occupants", 4),
+            "Elec (kWh/yr)": round(ek, 1),
+            "Gas (kWh/yr)": round(gk, 1),
+            "Total (kWh/yr)": round(tk, 1),
+            "Elec %": round(ek/tk*100, 1) if tk > 0 else 0,
+            "Gas %": round(gk/tk*100, 1) if tk > 0 else 0,
+            "Elec Cost/yr (USD)": round(eu2, 2),
+            "Gas Cost/yr (USD)": round(gu2, 2),
+            "Total Cost/yr (USD)": round(tcu, 2),
+            "Total Cost/yr (DZD)": round(tcd, 0),
+            "Avg Cost/hr (USD)": round(tcu/HOURS_IN_YEAR, 5),
+        })
     st.dataframe(pd.DataFrame(apt_rows), use_container_width=True, hide_index=True)
 
-    # ── Room breakdown table ──────────────────
-    st.subheader("🏠 Energy by Room")
+    # ── Room table ────────────────────────────
+    st.subheader("🏠 Electricity by Room")
     room_rows = []
     for (fn, ak), ar in sorted(results["apt_results"].items()):
         apt_obj = st.session_state.floors[fn]["apartments"][ak]
-        for rk, rr in sorted(ar["room_results"].items()):
-            room_name = apt_obj["rooms"][rk]["name"]
-            usd_y, dzd_y = cost_per_year(rr["total"])
-            usd_h, dzd_h = cost_per_hour(rr["total"])
+        for rk, rr in sorted(ar["elec"]["room_results"].items()):
+            rname = apt_obj["rooms"][rk]["name"]
+            eu3, ed3 = elec_cost(rr["total"])
             room_rows.append({
-                "Floor":             fn,
-                "Apt":               ak,
-                "Room":              rk,
-                "Room Name":         room_name,
-                "Area (m²)":         round(rr["area_m2"], 1),
-                "Cooling (kWh)":     round(rr["wall_load"]+rr["window_load"], 1),
-                "Appliances (kWh)":  round(rr["appliance_total"], 1),
-                "Plug Load (kWh)":   round(rr["plug_load"], 1),
-                "Total (kWh/yr)":    round(rr["total"], 1),
-                "Cost/yr (USD)":     round(usd_y, 2),
-                "Cost/yr (DZD)":     round(dzd_y, 0),
-                "Avg Cost/hr (USD)": round(usd_h, 5),
-                "Avg Cost/hr (DZD)": round(dzd_h, 4),
+                "Floor": fn, "Apt": ak, "Room": rk, "Name": rname,
+                "Area (m²)": round(rr["area_m2"], 1),
+                "Cooling (kWh)": round(rr["wall_load"]+rr["window_load"], 1),
+                "Appliances (kWh)": round(rr["appliance_total"], 1),
+                "Plug Load (kWh)": round(rr["plug_load"], 1),
+                "Total (kWh/yr)": round(rr["total"], 1),
+                "Cost/yr (USD)": round(eu3, 2),
+                "Cost/yr (DZD)": round(ed3, 0),
+                "Avg Cost/hr (USD)": round(eu3/HOURS_IN_YEAR, 5),
             })
     st.dataframe(pd.DataFrame(room_rows), use_container_width=True, hide_index=True)
 
-    # ── Top 5 appliances ─────────────────────
-    st.subheader("🔌 Top 5 Energy-Consuming Appliances (Building-wide)")
+    # ── Gas breakdown table ───────────────────
+    st.subheader("🔥 Gas Breakdown by Apartment")
+    gas_rows = []
+    for (fn, ak), ar in sorted(results["apt_results"].items()):
+        apt_obj = st.session_state.floors[fn]["apartments"][ak]
+        gr2 = ar["gas"]
+        gu3, gd3 = gas_cost(gr2["total"])
+        gas_rows.append({
+            "Floor": fn, "Apt": ak, "Name": apt_obj["name"],
+            "Heating (kWh)": round(gr2["heating"], 1),
+            "Hot Water (kWh)": round(gr2["hot_water"], 1),
+            "Cooking (kWh)": round(gr2["cooking"], 1),
+            "Gas Appliances (kWh)": round(gr2["gas_appliances"], 1),
+            "Total Gas (kWh/yr)": round(gr2["total"], 1),
+            "Gas Cost/yr (USD)": round(gu3, 2),
+            "Gas Cost/yr (DZD)": round(gd3, 0),
+            "Avg Gas Cost/hr (USD)": round(gu3/HOURS_IN_YEAR, 5),
+        })
+    st.dataframe(pd.DataFrame(gas_rows), use_container_width=True, hide_index=True)
+
+    # ── Top 5 electric appliances ─────────────
+    st.subheader("🔌 Top 5 Electric Appliances (Building-wide)")
     all_appls = []
     for (fn, ak), ar in results["apt_results"].items():
-        for rk, rr in ar["room_results"].items():
+        for rk, rr in ar["elec"]["room_results"].items():
             for appl in rr["appliance_breakdown"]:
-                all_appls.append({
-                    "Appliance": appl["name"],
-                    "kWh/year":  round(appl["kwh"], 1),
-                    "Watts":     appl["watts"],
-                    "Hours/day": appl["hours"],
-                    "Floor":     fn, "Apt": ak, "Room": rk,
-                })
+                all_appls.append({"Appliance": appl["name"], "kWh/yr": round(appl["kwh"],1),
+                                   "Watts": appl["watts"], "Hrs/day": appl["hours"],
+                                   "Floor": fn, "Apt": ak, "Room": rk})
     if all_appls:
-        adf = pd.DataFrame(all_appls).sort_values("kWh/year", ascending=False).head(5)
+        adf = pd.DataFrame(all_appls).sort_values("kWh/yr", ascending=False).head(5)
         st.dataframe(adf, use_container_width=True, hide_index=True)
-        st.bar_chart(adf.set_index("Appliance")["kWh/year"])
+        st.bar_chart(adf.set_index("Appliance")["kWh/yr"])
     else:
-        st.info("No appliances added to any room yet.")
+        st.info("No electric appliances added yet.")
 
+    # ── EUI reference ─────────────────────────
     st.divider()
     st.subheader("📋 EUI Benchmark Reference")
-    st.dataframe(
-        pd.DataFrame([
-            {"Max EUI (kWh/m²/yr)": t if t < 999 else "999+", "Rating": l}
-            for t, l in EUI_BENCHMARKS
-        ]),
-        use_container_width=True, hide_index=True,
-    )
+    st.dataframe(pd.DataFrame([
+        {"Max EUI (kWh/m²/yr)": t if t<999 else "999+", "Rating": l}
+        for t, l in EUI_BENCHMARKS
+    ]), use_container_width=True, hide_index=True)
 
 # ─────────────────────────────────────────────
 # PAGE: SAVE / LOAD
 # ─────────────────────────────────────────────
 def page_save_load():
     st.title("💾 Save / Load Project")
-
     st.subheader("💾 Save")
     pname = st.text_input("Project name", value=st.session_state.building["name"])
     if st.button("💾 Save to Database"):
         if pname.strip():
             save_project_to_db(pname, st.session_state.building, st.session_state.floors)
             st.success(f"Saved: '{pname}'")
-        else:
-            st.error("Enter a project name.")
+        else: st.error("Enter a project name.")
 
     st.divider()
     st.subheader("📂 Load")
@@ -1142,16 +1190,11 @@ def page_save_load():
         lc1, lc2 = st.columns(2)
         with lc1:
             if st.button("📂 Load Project"):
-                if load_project_from_db(opts[sel]):
-                    st.success("Loaded!")
-                    st.rerun()
-                else:
-                    st.error("Failed to load.")
+                if load_project_from_db(opts[sel]): st.success("Loaded!"); st.rerun()
+                else: st.error("Failed to load.")
         with lc2:
             if st.button("🗑️ Delete Project"):
-                delete_project_from_db(opts[sel])
-                st.success("Deleted.")
-                st.rerun()
+                delete_project_from_db(opts[sel]); st.success("Deleted."); st.rerun()
     else:
         st.info("No saved projects.")
 
@@ -1159,17 +1202,14 @@ def page_save_load():
     st.subheader("📤 Export / Import (JSON)")
     ec1, ec2 = st.columns(2)
     with ec1:
-        st.download_button(
-            "⬇️ Export Project (JSON)", data=export_to_json(),
-            file_name=f"{st.session_state.building['name'].replace(' ','_')}.json",
-            mime="application/json",
-        )
+        st.download_button("⬇️ Export Project (JSON)", data=export_to_json(),
+            file_name=f"{st.session_state.building['name'].replace(' ','_')}.json", mime="application/json")
     with ec2:
         upl = st.file_uploader("⬆️ Import Project (JSON)", type=["json"], key="proj_imp")
         if upl:
             ok, msg = import_from_json(upl.read().decode("utf-8"))
             if ok: st.success(msg); st.rerun()
-            else:  st.error(msg)
+            else: st.error(msg)
 
 # ─────────────────────────────────────────────
 # PAGE: HELP
@@ -1181,74 +1221,67 @@ def page_help():
 ```
 🏢 Building
 └── 📐 Floor 1
-    └── 🚪 Apartment A
-        ├── ▶ 🏠 Room 1: Living Room   ← selected
+    └── 🚪 Apartment A  (occupants, cooking gas, gas appliances)
+        ├── ▶ 🏠 Room 1: Living Room  (walls, windows, electric appliances)
         └──   🏠 Room 2: Bedroom
 ```
-Each **Room** has its own wall, window, plug, ceiling, and appliance inputs.
-An **Apartment** total = sum of all its rooms.
-A **Floor** total = sum of all its apartments.
-The **Building** total = sum of all floors.
 
 ---
 
-## Sidebar Tree Controls
-
-| Button | Action |
-|--------|--------|
-| ➕ Apt | Add apartment to that floor |
-| 📋 Floor | Duplicate entire floor |
-| 🗑️ Del (floor) | Delete floor |
-| ➕ Rm | Add room to that apartment |
-| 📋 Apt | Duplicate apartment on same floor |
-| 🗑️ Apt | Delete apartment |
-| 🏠 Room button | Click to load room into Dashboard |
-| ➕ Add Floor | Add new empty floor at the bottom |
+## Dashboard Tabs
+- **⚡ Electricity tab** — Room-level inputs: walls, windows, plug count, electric appliances
+- **🔥 Gas tab** — Apartment-level inputs: occupants, cooking kWh, gas appliances
 
 ---
 
-## Cost Display
-Every result shows **3 values**:
-- **kWh/year** — total energy
-- **Cost/year** — `kWh × price` in both USD and DZD
-- **Avg Cost/hour** — `Cost/year ÷ 8760` in both USD and DZD
+## Gas Calculation Formula
+```
+Heating gas (kWh/yr) =
+  (wall_UA + window_UA + roof_UA) × degree_days × 24h × climate_factor
+  ÷ heater_efficiency ÷ 1000
 
-Adjust price and exchange rate in **Building Settings**.
+Hot water gas (kWh/yr) = occupants × 1,095
+
+Cooking gas (kWh/yr)   = user input (default 1,825 for family of 4)
+
+Gas appliances (kWh/yr) = kWh/hr × hours/day × 365
+```
+
+**Constants:** Degree-days = 1,136  |  Heater efficiency = 65%  |  Roof U-value = 0.75 W/m²K
 
 ---
 
-## Calculation Summary
-- **Wall cooling load** = Wall area × U-value × 15°C × 8h × 120 days / 1000
-- **Window cooling load** = Window area × U-value × 15°C × 8h × 120 days / 1000
-- **Appliance load** = Watts × hours/day × days/year / 1000
-- **Plug load** = plug count × 50W × 8h × 365 / 1000
-- **Total** = (all loads) × climate multiplier × location multiplier
-
-## Climate Zones
-| Zone | Cooling × | Heating × |
-|------|-----------|-----------|
+## Climate Multipliers
+| Zone | Elec Cooling × | Gas Heating × |
+|------|----------------|---------------|
 | Coast | 1.1 | 0.8 |
 | Desert | 1.4 | 0.6 |
 | Mountains | 0.6 | 1.5 |
 | City | 1.0 | 1.0 |
 
-## EUI Benchmarks
-| EUI (kWh/m²/yr) | Rating |
-|-----------------|--------|
-| < 50 | Excellent |
-| 50–100 | Good |
-| 100–150 | Average |
-| 150–200 | Below average |
-| 200–300 | Poor |
-| > 300 | Very poor |
+---
+
+## Cost Display (3 values everywhere)
+- **kWh/year** — total energy
+- **Cost/year** — in USD and DZD
+- **Avg cost/hour** — cost/year ÷ 8,760 hours
+
+Default prices: **Electricity $0.12/kWh** | **Gas $0.02/kWh** (Algeria subsidized)
+
+---
+
+## Argentina Benchmark
+The app compares your building's gas/electricity split against the **88% gas / 12% electricity**
+split reported in the Argentina residential energy study. Cold climates (Mountains) will tend
+toward gas-heavy usage; hot climates (Desert/Coast) toward electricity-heavy.
 
 ---
 
 ## Tips
-- **Load Example Building** → instantly see a working 3-floor / 2-apt / 2-room example
-- **Save Room as Template** → reuse room configs across any apartment
-- **Export JSON** → back up or share your project file
-- **Copy Room** → copy a room's config to any floor / apartment / room slot
+- Click **🏗️ Load Example Building** to see a working 3-floor example
+- Gas inputs are per-apartment; heating is automatically summed from all rooms
+- Adjust gas price in **Building Settings** (default = $0.02 Algeria subsidized rate)
+- Export as JSON to back up or share your project
 """)
 
 # ─────────────────────────────────────────────
@@ -1262,7 +1295,7 @@ def main():
     pg = st.session_state.page
     if   pg == "Dashboard":           page_dashboard()
     elif pg == "Building Settings":   page_building_settings()
-    elif pg == "Apartment Templates": page_templates()
+    elif pg == "Room Templates":      page_templates()
     elif pg == "Results & Forecast":  page_results()
     elif pg == "Save/Load Project":   page_save_load()
     elif pg == "Help":                page_help()
