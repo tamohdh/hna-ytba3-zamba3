@@ -88,10 +88,6 @@ EUI_BENCHMARKS = [
     (999, "Very poor — Urgent action required"),
 ]
 
-# Argentina study benchmark: 88% gas / 12% electricity
-ARG_GAS_SHARE  = 0.88
-ARG_ELEC_SHARE = 0.12
-
 DB_PATH       = "building_energy.db"
 HOURS_IN_YEAR = 8760
 DEGREE_DAYS   = 1136   # standard heating degree-days
@@ -896,13 +892,7 @@ def page_dashboard():
         cm2.metric("🔥 Gas",          f"{gr['total']:,.0f} kWh/yr  ({gas_pct:.1f}%)")
         cm3.metric("🏠 Combined",     f"{combined:,.0f} kWh/yr")
 
-        # Argentina benchmark comparison
-        st.markdown("#### 📊 vs Argentina Study Benchmark (88% Gas / 12% Electricity)")
-        bm1, bm2, bm3, bm4 = st.columns(4)
-        bm1.metric("Your Gas %",      f"{gas_pct:.1f}%",   f"{gas_pct - ARG_GAS_SHARE*100:+.1f}% vs benchmark")
-        bm2.metric("Your Elec %",     f"{elec_pct:.1f}%",  f"{elec_pct - ARG_ELEC_SHARE*100:+.1f}% vs benchmark")
-        bm3.metric("Benchmark Gas",   f"{ARG_GAS_SHARE*100:.0f}%")
-        bm4.metric("Benchmark Elec",  f"{ARG_ELEC_SHARE*100:.0f}%")
+
 
 # ─────────────────────────────────────────────
 # PAGE: BUILDING SETTINGS
@@ -1051,22 +1041,6 @@ def page_results():
     bh1.metric("⚡ Elec Avg/hr",  fmt_usd_dzd_hr(eu, ed))
     bh2.metric("🔥 Gas Avg/hr",   fmt_usd_dzd_hr(gu, gd))
     bh3.metric("🏠 Total Avg/hr", fmt_usd_dzd_hr(tu, td))
-
-    st.divider()
-
-    # ── Argentina benchmark ───────────────────
-    st.subheader("📊 Argentina Study Benchmark (88% Gas / 12% Electricity)")
-    ab1, ab2, ab3, ab4 = st.columns(4)
-    ab1.metric("Your Gas Share",   f"{gas_pct:.1f}%",  f"{gas_pct  - ARG_GAS_SHARE*100:+.1f}% vs 88%")
-    ab2.metric("Your Elec Share",  f"{elec_pct:.1f}%", f"{elec_pct - ARG_ELEC_SHARE*100:+.1f}% vs 12%")
-    ab3.metric("Benchmark Gas",    f"{ARG_GAS_SHARE*100:.0f}%")
-    ab4.metric("Benchmark Elec",   f"{ARG_ELEC_SHARE*100:.0f}%")
-    if gas_pct > ARG_GAS_SHARE * 100:
-        st.warning(f"⚠️ Your gas share ({gas_pct:.1f}%) is higher than the Argentina benchmark ({ARG_GAS_SHARE*100:.0f}%). Consider improving insulation or switching to more efficient heating.")
-    elif elec_pct > ARG_ELEC_SHARE * 100:
-        st.info(f"ℹ️ Your electricity share ({elec_pct:.1f}%) is higher than the Argentina benchmark ({ARG_ELEC_SHARE*100:.0f}%). This is typical for hot/coastal climates with high AC usage.")
-    else:
-        st.success("✅ Your energy split is close to the Argentina benchmark.")
 
     st.divider()
 
@@ -1267,13 +1241,6 @@ Gas appliances (kWh/yr) = kWh/hr × hours/day × 365
 - **Avg cost/hour** — cost/year ÷ 8,760 hours
 
 Default prices: **Electricity $0.12/kWh** | **Gas $0.02/kWh** (Algeria subsidized)
-
----
-
-## Argentina Benchmark
-The app compares your building's gas/electricity split against the **88% gas / 12% electricity**
-split reported in the Argentina residential energy study. Cold climates (Mountains) will tend
-toward gas-heavy usage; hot climates (Desert/Coast) toward electricity-heavy.
 
 ---
 
